@@ -1,4 +1,5 @@
 import streamlit as st
+from datetime import datetime, timezone
 from supabase import create_client, Client
 
 
@@ -10,15 +11,18 @@ def init_connection():
 
 
 def get_room(supabase: Client, room_code: str):
-    response = supabase.table("games").select("*").eq("room_code", room_code).execute()
+    response = (
+        supabase.table("games")
+        .select("room_code,player1,player2,scores,turn_state,last_action")
+        .eq("room_code", room_code)
+        .execute()
+    )
     if response.data and len(response.data) > 0:
         return response.data[0]
     return None
 
 
 def create_room(supabase: Client, room_code: str, player1: str, target_score: int):
-    # Try to insert first. If it fails due to conflict, we catch it and ignore it
-    # to avoid overwriting player2 if they already joined in a weird race condition
     data = {
         "room_code": room_code,
         "player1": player1,
@@ -35,39 +39,22 @@ def create_room(supabase: Client, room_code: str, player1: str, target_score: in
             "game_over": False,
             "winner": 0,
         },
-        "last_action": "now()",
+        "last_action": datetime.now(timezone.utc).isoformat(),
     }
-
-    try:
-        # First check if the room exists
-        existing = (
-            supabase.table("games").select("*").eq("room_code", room_code).execute()
-        )
-        if existing.data and len(existing.data) > 0:
-            # Room exists, just update player 1 name in case it changed
-            supabase.table("games").update({"player1": player1}).eq(
-                "room_code", room_code
-            ).execute()
-        else:
-            # Room doesn't exist, insert it
-            supabase.table("games").insert(data).execute()
-    except Exception as e:
-        print(f"Db create room error: {e}")
-
-    return True
+    return supabase.table("games").insert(data).execute()
 
 
 def join_room(supabase: Client, room_code: str, player2: str):
-    data = {"player2": player2, "last_action": "now()"}
-    try:
-        supabase.table("games").update(data).eq("room_code", room_code).execute()
-    except Exception as e:
-        print(f"Db join room error: {e}")
-    return True
+    data = {"player2": player2, "last_action": datetime.now(timezone.utc).isoformat()}
+    return supabase.table("games").update(data).eq("room_code", room_code).execute()
 
 
 def update_game_state(supabase: Client, room_code: str, scores: dict, turn_state: dict):
-    updates = {"scores": scores, "turn_state": turn_state, "last_action": "now()"}
+    updates = {
+        "scores": scores,
+        "turn_state": turn_state,
+        "last_action": datetime.now(timezone.utc).isoformat(),
+    }
     response = (
         supabase.table("games").update(updates).eq("room_code", room_code).execute()
     )

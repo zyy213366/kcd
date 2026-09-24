@@ -1,366 +1,283 @@
+"""KCD Farkle: a small two-player room game."""
+
+from html import escape
+from uuid import uuid4
+
 import streamlit as st
-import time
-from game_logic import roll_dice, calculate_score, is_farkle
 from streamlit_autorefresh import st_autorefresh
-from db_manager import (
-    init_connection,
-    get_room,
-    create_room,
-    join_room,
-    update_game_state,
+
+from app_state import clear_selection, load_room_snapshot, selection_for, should_poll_room
+from db_manager import create_room, get_room, init_connection, join_room, update_game_state
+from game_logic import roll_dice
+from turn_actions import bank_turn, roll_turn, selection_score
+
+
+st.set_page_config(page_title="KCD 骰子对决", page_icon="🎲", layout="centered")
+
+st.markdown(
+    """
+<style>
+  .stApp { background: #f7f9f6; color: #18251c; }
+  .block-container { max-width: 820px; padding-top: 1.4rem; padding-bottom: 5rem; }
+  h1, h2, h3 { color: #162e20; letter-spacing: -.025em; }
+  h1 { font-size: clamp(2rem, 6vw, 3rem) !important; }
+  div[data-testid="stForm"], .st-key-dice_grid {
+    background: white; border: 1px solid #e5ebe5; border-radius: 22px;
+    padding: 1rem 1.15rem; box-shadow: 0 8px 30px rgba(16, 48, 27, .04);
+  }
+  .eyebrow { color: #5b7563; font-size: .78rem; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; }
+  .intro { color: #5d6e61; font-size: 1.04rem; margin: -.3rem 0 1.5rem; }
+  .room-id { color: #66816d; font-size: .88rem; font-weight: 700; letter-spacing: .06em; }
+  .score-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .75rem; margin: 1rem 0; }
+  .score-card { background: #fff; border: 1px solid #e5ebe5; border-radius: 20px; padding: 1rem 1.1rem; min-width: 0; }
+  .score-card.active { border-color: #9ac5a5; background: #f0f9f1; }
+  .score-name { color: #607363; font-size: .9rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .score-value { color: #183621; font-size: clamp(1.8rem, 6vw, 2.6rem); font-weight: 800; line-height: 1.15; margin: .35rem 0 .6rem; }
+  .score-track { height: 7px; background: #e8eee8; border-radius: 100px; overflow: hidden; }
+  .score-progress { height: 100%; background: #3d8d59; border-radius: inherit; }
+  .turn-panel { background: #e9f3eb; border-radius: 18px; padding: .9rem 1.1rem; margin: .9rem 0 1.2rem; }
+  .turn-title { font-weight: 800; font-size: 1.1rem; color: #1d5631; }
+  .turn-detail { color: #54705b; margin-top: .2rem; font-size: .92rem; }
+  .score-preview { color: #42624b; font-size: 1rem; margin: .6rem 0 1rem; }
+  .st-key-dice_grid [data-testid="stButton"] button { min-height: 4.2rem; width: 100%; font-size: 1.15rem; border-radius: 16px; }
+  .st-key-actions [data-testid="stButton"] button { min-height: 3.4rem; width: 100%; border-radius: 13px; font-weight: 700; }
+  div[data-testid="stFormSubmitButton"] button { min-height: 3rem; width: 100%; border-radius: 12px; }
+  @media (max-width: 600px) {
+    .block-container { padding: .9rem .85rem 4rem; }
+    .score-grid { gap: .5rem; }
+    .score-card { padding: .85rem; border-radius: 16px; }
+    .st-key-dice_grid { padding: .75rem; }
+    .st-key-dice_grid [data-testid="stHorizontalBlock"] { gap: .45rem; flex-wrap: nowrap; }
+    .st-key-dice_grid [data-testid="stColumn"] { min-width: 0; flex: 1 1 0; }
+    .st-key-dice_grid [data-testid="stButton"] button { min-height: 3.7rem; font-size: 1rem; padding: .35rem; }
+  }
+</style>
+""",
+    unsafe_allow_html=True,
 )
 
-# Supabase Initialization
+
 try:
     supabase = init_connection()
-except Exception as e:
-    st.error(f"Failed to connect to Supabase. Check secrets. Error: {e}")
+except Exception as exc:
+    st.error(f"无法连接游戏服务，请检查 Supabase 配置：{exc}")
     st.stop()
 
-# Session State Initialization
-if "room_code" not in st.session_state:
-    st.session_state.room_code = ""
-if "player_num" not in st.session_state:
-    st.session_state.player_num = 0
-if "animating" not in st.session_state:
-    st.session_state.animating = False
-if "anim_flip" not in st.session_state:
-    st.session_state.anim_flip = False
+
+def enter_room(room_code, name, player_num):
+    st.session_state.room_code = room_code
+    st.session_state.player_name = name
+    st.session_state.player_num = player_num
+    st.session_state.pop("_room_snapshot", None)
+    clear_selection(st.session_state)
+    st.rerun()
 
 
-# --- UI Functions ---
 def show_login():
-    st.title("🎲 KCD Farkle (Online)")
+    st.markdown('<div class="eyebrow">KCD · ONLINE FARKLE</div>', unsafe_allow_html=True)
+    st.title("🎲 骰子对决")
+    st.markdown('<p class="intro">创建房间，邀请朋友，轮流掷骰冲向目标分数。</p>', unsafe_allow_html=True)
 
-    st.write("Join or create a room to play.")
+    with st.form("room_form"):
+        room = st.text_input("房间码", placeholder="例如 KCD888", max_chars=20).strip().upper()
+        name = st.text_input("你的名字", placeholder="输入玩家昵称", max_chars=24).strip()
+        target_score = st.number_input("目标分数（创建房间时使用）", min_value=1000, max_value=50000, value=10000, step=1000)
+        create_col, join_col = st.columns(2, gap="small")
+        create_clicked = create_col.form_submit_button("创建房间", type="primary", use_container_width=True)
+        join_clicked = join_col.form_submit_button("加入房间", use_container_width=True)
 
-    room = st.text_input("Room Code")
-    name = st.text_input("Your Name")
-    target_score = st.number_input(
-        "Target Score (Create Room)", min_value=1000, max_value=50000, value=10000
-    )
+    if not (create_clicked or join_clicked):
+        return
+    if not room or not name:
+        st.warning("请填写房间码和昵称。")
+        return
+    try:
+        existing = get_room(supabase, room)
+        if not existing and join_clicked:
+            st.error("找不到这个房间，请确认房间码。")
+            return
+        if not existing:
+            create_room(supabase, room, name, int(target_score))
+            enter_room(room, name, 1)
+            return
+        if existing.get("player1") == name:
+            player_num = 1
+        elif existing.get("player2") == name:
+            player_num = 2
+        elif not existing.get("player2"):
+            join_room(supabase, room, name)
+            player_num = 2
+        else:
+            st.error("房间已满，请换一个房间码。")
+            return
+        enter_room(room, name, player_num)
+    except Exception as exc:
+        st.error(f"进入房间失败，请重试：{exc}")
 
-    col1, col2 = st.columns(2)
-    if col1.button("Create Room"):
-        if room and name:
-            existing = get_room(supabase, room)
-            if existing:
-                p1_name = existing.get("player1")
-                p2_name = existing.get("player2")
-                if p1_name == name:
-                    st.session_state.player_num = 1
-                elif p2_name == name:
-                    st.session_state.player_num = 2
-                elif not p2_name:
-                    join_room(supabase, room, name)
-                    st.session_state.player_num = 2
-                else:
-                    st.error("Room is full.")
-                    return
-            else:
-                create_room(supabase, room, name, int(target_score))
-                st.session_state.player_num = 1
 
-            st.session_state.room_code = room
-            st.session_state.player_name = name
-            st.rerun()
+def score_card(name, score, target, active):
+    safe_name = escape(str(name))
+    progress = min(100, max(0, score / target * 100))
+    active_class = " active" if active else ""
+    return f"""<div class="score-card{active_class}">
+      <div class="score-name">{safe_name}</div>
+      <div class="score-value">{score:,}</div>
+      <div class="score-track"><div class="score-progress" style="width:{progress:.1f}%"></div></div>
+    </div>"""
 
-    if col2.button("Join Room"):
-        if room and name:
-            existing = get_room(supabase, room)
-            if not existing:
-                st.error("Room not found.")
-                return
 
-            p1_name = existing.get("player1")
-            p2_name = existing.get("player2")
-            if p1_name == name:
-                st.session_state.player_num = 1
-            elif p2_name == name:
-                st.session_state.player_num = 2
-            elif not p2_name:
-                # When Player 2 clicks join, force an update in the database
-                join_room(supabase, room, name)
-                st.session_state.player_num = 2
-            else:
-                st.error("Room is full.")
-                return
-
-            st.session_state.room_code = room
-            st.session_state.player_name = name
-            st.rerun()
+def save_action(room_data, scores, turn_state):
+    """Persist once, then show the new state without another immediate read."""
+    update_game_state(supabase, st.session_state.room_code, scores, turn_state)
+    st.session_state._room_snapshot = {
+        **room_data,
+        "scores": scores,
+        "turn_state": turn_state,
+        "last_action": uuid4().hex,
+    }
+    clear_selection(st.session_state)
 
 
 def show_game(room_data):
-    st.title(f"Room: {room_data['room_code']}")
+    turn = room_data["turn_state"]
+    scores = room_data["scores"]
+    player_num = st.session_state.player_num
+    current_player = turn["current_player"]
+    is_my_turn = current_player == player_num
+    game_over = turn.get("game_over", False)
+    player1 = room_data["player1"]
+    player2 = room_data.get("player2")
+    target = max(1, turn.get("target_score", 10000))
 
-    p1_name = room_data["player1"]
-    p2_name = room_data["player2"] or "Waiting..."
-    target_score = room_data["turn_state"].get("target_score", 10000)
-    is_game_over = room_data["turn_state"].get("game_over", False)
-    winner = room_data["turn_state"].get("winner", 0)
+    top_col, leave_col = st.columns([4, 1])
+    with top_col:
+        st.markdown('<div class="eyebrow">KCD · 骰子对决</div>', unsafe_allow_html=True)
+        st.title("游戏进行中" if not game_over else "本局结束")
+        st.markdown(f'<div class="room-id">房间码 · {escape(st.session_state.room_code)}</div>', unsafe_allow_html=True)
+    if leave_col.button("退出", use_container_width=True):
+        st.session_state.room_code = ""
+        st.session_state.pop("_room_snapshot", None)
+        clear_selection(st.session_state)
+        st.rerun()
 
-    col1, col2 = st.columns(2)
-    col1.metric(p1_name, room_data["scores"]["p1"])
-    col2.metric(p2_name, room_data["scores"]["p2"])
-
-    current_player = room_data["turn_state"]["current_player"]
-    is_my_turn = current_player == st.session_state.player_num
-
-    st.subheader(
-        f"Current Turn: {'You' if is_my_turn else ('Player ' + str(current_player))}"
+    st.markdown(
+        '<div class="score-grid">'
+        + score_card(player1, scores["p1"], target, current_player == 1 and not game_over)
+        + score_card(player2 or "等待玩家加入", scores["p2"], target, current_player == 2 and not game_over)
+        + '</div>',
+        unsafe_allow_html=True,
     )
-    st.caption(f"Target Score: {target_score}")
-    st.write(f"Round Score: {room_data['turn_state']['round_score']}")
-    if is_game_over:
-        winner_name = p1_name if winner == 1 else p2_name
-        st.success(f"Game Over! Winner: {winner_name}")
+    st.caption(f"目标分数 {target:,} · 两人轮流掷骰，选出可得分的骰子")
 
-    # --- Dice Rendering ---
-    dice_results = room_data["turn_state"].get("current_dice", [])
-    locked_dice = room_data["turn_state"].get("locked_dice", [])
-    previously_locked = room_data["turn_state"].get("previously_locked", [])
-    remaining = room_data["turn_state"].get("dice_remaining", 6)
-
-    if dice_results:
-        st.write("Current Dice:")
-        cols = st.columns(len(dice_results))
-        new_locked = []
-        for i, val in enumerate(dice_results):
-            with cols[i]:
-                # 渲染 GIF
-                # Use query params to break cache to restart gif animation
-                if st.session_state.anim_flip:
-                    st.write(" ")
-                placeholder = st.empty()
-                placeholder.image(f"assets/{val}.gif", width=80)
-                if not st.session_state.anim_flip:
-                    st.write(" ")
-
-                # Checkbox
-                if is_my_turn:
-                    is_locked = i < len(locked_dice) and locked_dice[i]
-                    is_confirmed = i < len(previously_locked) and previously_locked[i]
-                    if is_confirmed:
-                        st.checkbox(
-                            "Lock",
-                            value=True,
-                            key=f"dice_{i}",
-                            disabled=True,
-                        )
-                        new_locked.append(True)
-                    else:
-                        if st.checkbox("Lock", value=is_locked, key=f"dice_{i}"):
-                            new_locked.append(True)
-                        else:
-                            new_locked.append(False)
-                else:
-                    st.write(
-                        "Locked" if (i < len(locked_dice) and locked_dice[i]) else ""
-                    )
-
-        if is_my_turn and new_locked != locked_dice:
-            room_data["turn_state"]["locked_dice"] = new_locked
-            room_data["turn_state"]["dice_remaining"] = 6 - sum(
-                1 for x in new_locked if x
-            )
-            update_game_state(
-                supabase,
-                st.session_state.room_code,
-                room_data["scores"],
-                room_data["turn_state"],
-            )
-            st.rerun()
-
-    # Auto-refresh mechanism
-    if not is_my_turn:
-        # Run the autorefresh about every 2 seconds (2000 milliseconds)
-        st_autorefresh(interval=2000, key="datarefresh")
+    if game_over:
+        winner_name = player1 if turn.get("winner") == 1 else player2
+        st.success(f"🏆 {winner_name} 获胜！")
+        return
+    if not player2:
+        title, detail = "等待另一位玩家", "将房间码发给朋友，加入后即可开始。"
+    elif is_my_turn:
+        title, detail = "轮到你了", "选中有分的骰子，然后继续掷骰或存分。"
     else:
-        # IMPORTANT: When it IS your turn, you still need to refresh if p2_name is waiting
-        if p2_name == "Waiting...":
-            st_autorefresh(interval=2000, key="datarefresh_waiting")
+        title, detail = f"等待 {player1 if current_player == 1 else player2}", "对方行动后，棋盘会自动更新。"
+    st.markdown(
+        f'<div class="turn-panel"><div class="turn-title">{escape(title)}</div>'
+        f'<div class="turn-detail">{escape(detail)}</div></div>',
+        unsafe_allow_html=True,
+    )
 
-    if is_my_turn:
-        col1, col2, col3 = st.columns(3)
+    notice = st.session_state.pop("game_notice", None)
+    if notice:
+        st.warning(notice)
 
-        # Calculate potential score currently selected
-        newly_locked = []
-        if dice_results:
-            newly_locked = [
-                dice_results[i]
-                for i, locked in enumerate(locked_dice)
-                if locked
-                and not (
-                    room_data["turn_state"].get("previously_locked")
-                    and i < len(room_data["turn_state"].get("previously_locked", []))
-                    and room_data["turn_state"]["previously_locked"][i]
-                )
-            ]
-        temp_score, remaining_after_score = calculate_score(newly_locked)
+    dice = turn.get("current_dice", [])
+    confirmed = turn.get("previously_locked", [])
+    selected = selection_for(st.session_state, room_data)
+    st.subheader("本轮骰子")
+    if dice:
+        with st.container(key="dice_grid"):
+            for start in range(0, len(dice), 3):
+                columns = st.columns(3, gap="small")
+                for index in range(start, min(start + 3, len(dice))):
+                    value = dice[index]
+                    fixed = index < len(confirmed) and confirmed[index]
+                    label = f"{value} 点 · {'已保留' if fixed else '已选' if selected[index] else '选择'}"
+                    if columns[index - start].button(
+                        label,
+                        key=f"die_{index}",
+                        type="primary" if selected[index] else "secondary",
+                        disabled=not is_my_turn or fixed or not player2,
+                        use_container_width=True,
+                    ):
+                        selected[index] = not selected[index]
+                        st.rerun()
+    else:
+        st.info("点击“掷骰子”开始本轮。" if is_my_turn else "等待对方掷骰。")
 
-        can_roll = False
-        if not dice_results:
-            can_roll = True  # First roll
-        elif temp_score > 0:
-            can_roll = True  # Has scored something this roll, can push luck
+    temporary = selection_score(dice, selected, confirmed)
+    round_score = turn.get("round_score", 0)
+    st.markdown(
+        f'<div class="score-preview">本轮已得 <b>{round_score:,}</b>　·　当前选择 '
+        f'<b>+{temporary:,}</b>　·　可存入 <b>{round_score + temporary:,}</b></div>',
+        unsafe_allow_html=True,
+    )
+    if not is_my_turn or not player2:
+        return
 
-        if col1.button(
-            "Roll Dice",
-            disabled=not p2_name
-            or p2_name == "Waiting..."
-            or not can_roll
-            or is_game_over,
-        ):
-            # 如果是回合的第一次掷骰子或者全部被锁定
-            if not dice_results or all(locked_dice) or any(locked_dice):
-                # We need to bank the temp score to round score before re-rolling
-                if temp_score > 0:
-                    room_data["turn_state"]["round_score"] += temp_score
+    with st.container(key="actions"):
+        roll_col, bank_col = st.columns(2, gap="small")
+        roll_clicked = roll_col.button(
+            "🎲 掷骰子" if not dice else "🎲 继续掷骰",
+            type="primary",
+            disabled=bool(dice) and temporary == 0,
+            use_container_width=True,
+        )
+        bank_clicked = bank_col.button(
+            f"存入 {round_score + temporary:,} 分",
+            disabled=not dice or round_score + temporary == 0,
+            use_container_width=True,
+        )
 
-                # 重新掷所有剩余的未锁定骰子 (或者如果全部锁定，重置 6 个)
-                dice_to_roll = 6 if (all(locked_dice) and dice_results) else remaining
-                new_dice = roll_dice(dice_to_roll)
+    if roll_clicked:
+        count = 6 if not dice or all(selected) else len(dice) - sum(selected)
+        next_dice = roll_dice(count)
+        try:
+            next_turn, farkled = roll_turn(turn, selected, next_dice)
+            save_action(room_data, scores, next_turn)
+        except Exception as exc:
+            st.error(f"掷骰结果未保存，请重试：{exc}")
+            return
+        if farkled:
+            st.session_state.game_notice = "爆骰！本轮分数清零，轮到对方。"
+        st.rerun()
 
-                # Check Farkle
-                if is_farkle(new_dice):
-                    st.error("Farkle! You lose your round score.")
-                    room_data["turn_state"]["round_score"] = 0
-                    room_data["turn_state"]["current_player"] = (
-                        2 if current_player == 1 else 1
-                    )
-                    room_data["turn_state"]["current_dice"] = []
-                    room_data["turn_state"]["locked_dice"] = []
-                    room_data["turn_state"]["previously_locked"] = []
-                    room_data["turn_state"]["dice_remaining"] = 6
-
-                    try:
-                        update_game_state(
-                            supabase,
-                            st.session_state.room_code,
-                            room_data["scores"],
-                            room_data["turn_state"],
-                        )
-                    except Exception as e:
-                        pass
-                    time.sleep(2)  # Show farkle message briefly
-                    st.rerun()
-                else:
-                    # 只有部分被重新掷了
-                    if dice_to_roll < 6:
-                        # 组合旧的锁定骰子和新骰子
-                        # Keep locked dice in their original positions, put new dice in unlocked positions
-                        combined_dice = [0] * 6
-                        new_dice_idx = 0
-                        for i in range(6):
-                            if locked_dice[i]:
-                                combined_dice[i] = dice_results[i]
-                            else:
-                                combined_dice[i] = new_dice[new_dice_idx]
-                                new_dice_idx += 1
-
-                        room_data["turn_state"]["current_dice"] = combined_dice
-                        # Mark previously locked dice as locked, and the new ones as unlocked
-                        room_data["turn_state"]["locked_dice"] = list(locked_dice)
-                        room_data["turn_state"]["previously_locked"] = list(locked_dice)
-                    else:
-                        room_data["turn_state"]["current_dice"] = new_dice
-                        room_data["turn_state"]["locked_dice"] = [False] * 6
-                        room_data["turn_state"]["previously_locked"] = [False] * 6
-
-                    room_data["turn_state"]["dice_remaining"] = dice_to_roll
-
-                try:
-                    update_game_state(
-                        supabase,
-                        st.session_state.room_code,
-                        room_data["scores"],
-                        room_data["turn_state"],
-                    )
-                except Exception as e:
-                    st.error(f"Failed to update game state: {e}")
-
-                # Set a unique animation key per roll to force gif to restart
-                import uuid
-
-                st.session_state.anim_key = str(uuid.uuid4())
-                st.session_state.animating = True
-                st.session_state.anim_flip = not st.session_state.anim_flip
-
-                # Using rerun at the end of the action
-                st.rerun()
-
-        if st.session_state.animating:
-            time.sleep(1.0)  # Wait for GIF to "finish"
-            st.session_state.animating = False
-            try:
-                st.rerun()
-            except Exception:
-                pass
-
-        if dice_results:
-            if col2.button(
-                f"Pass & Bank ({temp_score + room_data['turn_state']['round_score']})",
-                disabled=(
-                    temp_score == 0 and room_data["turn_state"]["round_score"] == 0
-                )
-                or st.session_state.animating
-                or is_game_over,
-            ):
-                # When banking, add the temporary score of currently locked dice to the round score before banking it
-                room_data["turn_state"]["round_score"] += temp_score
-
-                if current_player == 1:
-                    room_data["scores"]["p1"] += room_data["turn_state"]["round_score"]
-                else:
-                    room_data["scores"]["p2"] += room_data["turn_state"]["round_score"]
-
-                if room_data["scores"]["p1"] >= target_score:
-                    room_data["turn_state"]["game_over"] = True
-                    room_data["turn_state"]["winner"] = 1
-                elif room_data["scores"]["p2"] >= target_score:
-                    room_data["turn_state"]["game_over"] = True
-                    room_data["turn_state"]["winner"] = 2
-
-                room_data["turn_state"]["round_score"] = 0
-                if not room_data["turn_state"].get("game_over", False):
-                    room_data["turn_state"]["current_player"] = (
-                        2 if current_player == 1 else 1
-                    )
-                room_data["turn_state"]["current_dice"] = []
-                room_data["turn_state"]["locked_dice"] = []
-                room_data["turn_state"]["previously_locked"] = []
-                room_data["turn_state"]["dice_remaining"] = 6
-
-                try:
-                    update_game_state(
-                        supabase,
-                        st.session_state.room_code,
-                        room_data["scores"],
-                        room_data["turn_state"],
-                    )
-                except Exception as e:
-                    st.error(f"Failed to update game state: {e}")
-
-                try:
-                    st.rerun()
-                except Exception:
-                    pass
+    if bank_clicked:
+        try:
+            next_scores, next_turn = bank_turn(scores, turn, selected)
+            save_action(room_data, next_scores, next_turn)
+        except Exception as exc:
+            st.error(f"分数未保存，请重试：{exc}")
+            return
+        st.rerun()
 
 
-# --- Main App ---
-if "room_code" not in st.session_state or not st.session_state.room_code:
+if not st.session_state.get("room_code"):
     show_login()
 else:
-    try:
-        room_data = get_room(supabase, st.session_state.room_code)
-        if room_data:
-            show_game(room_data)
-        else:
-            st.error("Room lost or does not exist.")
-            if st.button("Back to login"):
-                st.session_state.room_code = ""
-                st.rerun()
-    except Exception as e:
-        st.error(f"Network error getting room: {e}")
-        st_autorefresh(interval=2000, key="datarefresh_error")
+    previous = st.session_state.get("_room_snapshot")
+    should_poll = should_poll_room(previous, st.session_state.player_num)
+    poll_tick = st_autorefresh(interval=2000, key="room_poll") if should_poll else None
+    room_data, fetch_error = load_room_snapshot(
+        st.session_state,
+        st.session_state.room_code,
+        poll_tick,
+        lambda code: get_room(supabase, code),
+    )
+    if fetch_error:
+        st.warning(f"连接暂时中断，显示上次游戏状态：{fetch_error}")
+    if room_data:
+        show_game(room_data)
+    else:
+        st.error("房间不存在或暂时无法读取。")
+        if st.button("返回房间入口"):
+            st.session_state.room_code = ""
+            st.rerun()
