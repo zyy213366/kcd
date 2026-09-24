@@ -146,9 +146,10 @@ def reload_after_conflict():
         st.session_state._room_poll_tick = 0
         clear_selection(st.session_state)
         st.session_state.game_notice = "房间状态已在另一窗口更新，已为你重新载入。"
-        st.rerun()
     except Exception as exc:
         st.error(f"房间状态已变化，但重新载入失败：{exc}")
+        return
+    st.rerun()
 
 
 def show_game(room_data):
