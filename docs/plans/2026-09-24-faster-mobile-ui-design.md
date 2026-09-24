@@ -12,7 +12,7 @@ The interface puts room identity and score progress first, then the current turn
 
 ## Data and error handling
 
-The existing `scores` and `turn_state` JSON remain compatible. Dice selection is transient session state, reset when a new roll or turn arrives. Fetching a room updates a session snapshot on the first render and each poll tick. A failed action keeps the current screen and shows an error; it does not silently claim success. A failed poll keeps the previous snapshot and displays a retry message.
+The existing `scores` and `turn_state` JSON remain compatible. Dice selection is transient session state, reset when a new roll or turn arrives. Fetching a room updates a session snapshot on the first render and each poll tick. Each action updates only if `last_action` still matches the fetched room version, and the returned row must confirm exactly one update. A conflict reloads the latest room state. A failed action keeps the current screen and shows an error; it does not silently claim success. A failed poll keeps the previous snapshot and displays a retry message.
 
 ## Verification
 

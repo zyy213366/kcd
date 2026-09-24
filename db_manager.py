@@ -3,6 +3,10 @@ from datetime import datetime, timezone
 from supabase import create_client, Client
 
 
+class ConcurrentUpdateError(RuntimeError):
+    """The room was changed before this action was saved."""
+
+
 @st.cache_resource
 def init_connection():
     url = st.secrets["supabase_url"]
@@ -49,13 +53,25 @@ def join_room(supabase: Client, room_code: str, player2: str):
     return supabase.table("games").update(data).eq("room_code", room_code).execute()
 
 
-def update_game_state(supabase: Client, room_code: str, scores: dict, turn_state: dict):
+def update_game_state(
+    supabase: Client,
+    room_code: str,
+    scores: dict,
+    turn_state: dict,
+    expected_action: str,
+):
     updates = {
         "scores": scores,
         "turn_state": turn_state,
         "last_action": datetime.now(timezone.utc).isoformat(),
     }
-    response = (
-        supabase.table("games").update(updates).eq("room_code", room_code).execute()
+    query = supabase.table("games").update(updates).eq("room_code", room_code)
+    query = (
+        query.eq("last_action", expected_action)
+        if expected_action is not None
+        else query.is_("last_action", "null")
     )
-    return response
+    rows = query.execute().data or []
+    if len(rows) != 1:
+        raise ConcurrentUpdateError("Room changed or is no longer writable")
+    return rows[0]

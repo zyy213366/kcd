@@ -1,13 +1,12 @@
 """KCD Farkle: a small two-player room game."""
 
 from html import escape
-from uuid import uuid4
 
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
 from app_state import clear_selection, load_room_snapshot, selection_for, should_poll_room
-from db_manager import create_room, get_room, init_connection, join_room, update_game_state
+from db_manager import ConcurrentUpdateError, create_room, get_room, init_connection, join_room, update_game_state
 from game_logic import roll_dice
 from turn_actions import bank_turn, roll_turn, selection_score
 
@@ -128,14 +127,28 @@ def score_card(name, score, target, active):
 
 def save_action(room_data, scores, turn_state):
     """Persist once, then show the new state without another immediate read."""
-    update_game_state(supabase, st.session_state.room_code, scores, turn_state)
-    st.session_state._room_snapshot = {
-        **room_data,
-        "scores": scores,
-        "turn_state": turn_state,
-        "last_action": uuid4().hex,
-    }
+    saved = update_game_state(
+        supabase,
+        st.session_state.room_code,
+        scores,
+        turn_state,
+        room_data.get("last_action"),
+    )
+    st.session_state._room_snapshot = saved
+    st.session_state._room_poll_tick = 0
     clear_selection(st.session_state)
+
+
+def reload_after_conflict():
+    """Show the latest turn when another session saved first."""
+    try:
+        st.session_state._room_snapshot = get_room(supabase, st.session_state.room_code)
+        st.session_state._room_poll_tick = 0
+        clear_selection(st.session_state)
+        st.session_state.game_notice = "房间状态已在另一窗口更新，已为你重新载入。"
+        st.rerun()
+    except Exception as exc:
+        st.error(f"房间状态已变化，但重新载入失败：{exc}")
 
 
 def show_game(room_data):
@@ -243,6 +256,9 @@ def show_game(room_data):
         try:
             next_turn, farkled = roll_turn(turn, selected, next_dice)
             save_action(room_data, scores, next_turn)
+        except ConcurrentUpdateError:
+            reload_after_conflict()
+            return
         except Exception as exc:
             st.error(f"掷骰结果未保存，请重试：{exc}")
             return
@@ -254,6 +270,9 @@ def show_game(room_data):
         try:
             next_scores, next_turn = bank_turn(scores, turn, selected)
             save_action(room_data, next_scores, next_turn)
+        except ConcurrentUpdateError:
+            reload_after_conflict()
+            return
         except Exception as exc:
             st.error(f"分数未保存，请重试：{exc}")
             return
